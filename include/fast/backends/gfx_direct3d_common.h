@@ -60,6 +60,7 @@ struct ShaderProgramD3D11 {
     uint8_t numInputs;
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
+    bool alphaBlend = false;
 };
 
 class GfxWindowBackendDXGI;
@@ -111,6 +112,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool BeginRtxOverlayFrame(uint32_t width, uint32_t height) override;
+    void EndRtxOverlayFrame() override;
+    uintptr_t GetRtxOverlayTextureId() override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -176,6 +180,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
 
     D3D_PRIMITIVE_TOPOLOGY mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    // RTX overlay target: transparent premultiplied RGBA plus its own depth.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mRtxOverlayTexture;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mRtxOverlayRtv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mRtxOverlaySrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mRtxOverlayDepthTexture;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mRtxOverlayDsv;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mRtxOverlayBlendAlpha;
+    uint32_t mRtxOverlayWidth = 0;
+    uint32_t mRtxOverlayHeight = 0;
+    bool mRtxOverlayActive = false;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,

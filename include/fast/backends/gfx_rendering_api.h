@@ -72,6 +72,18 @@ class GfxRenderingAPI {
     virtual FilteringMode GetTextureFilter() = 0;
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
+    // RTX overlay mode: while a ray tracer owns the scene, the interpreter
+    // rasterizes only the game's 2D overlay (HUD, text, menus, fades) into a
+    // transparent target that the ray tracer composites. Backends that don't
+    // support it return false and the frame is skipped as before.
+    virtual bool BeginRtxOverlayFrame(uint32_t width, uint32_t height) {
+        return false;
+    }
+    virtual void EndRtxOverlayFrame() {
+    }
+    virtual uintptr_t GetRtxOverlayTextureId() {
+        return 0;
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

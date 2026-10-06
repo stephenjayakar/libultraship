@@ -1162,6 +1162,9 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    if (mRtxOverlayFrame && !mRtxOverlayDraw && !mFbActive) {
+        return; // the ray tracer draws the world; offscreen targets are UI render-to-texture
+    }
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1361,6 +1364,9 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
 }
 
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    if (mRtxOverlayFrame && !mRtxOverlayDraw && !mFbActive) {
+        return;
+    }
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
@@ -2738,7 +2744,14 @@ bool gfx_noop_handler_f3dex2(F3DGfx** cmd0) {
     const char* filename = (const char*)(cmd)->words.w1;
     uint32_t p = C0(16, 8);
     uint32_t l = C0(0, 16);
-    if (p == 7) {
+    if (p == 9) {
+        // RTX overlay marker: flush what was batched under the old state.
+        Interpreter* gfx = mInstance.lock().get();
+        if (gfx->mRtxOverlayFrame && gfx->mRtxOverlayDraw != (l != 0)) {
+            gfx->Flush();
+            gfx->mRtxOverlayDraw = l != 0;
+        }
+    } else if (p == 7) {
         g_exec_stack.openDisp(filename, l);
     } else if (p == 8) {
         if (g_exec_stack.disp_stack.size() == 0) {
@@ -3489,7 +3502,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
-    gfx->mRapi->StartDrawToFramebuffer(gfx->mRendersToFb ? gfx->mGameFb : 0,
+    gfx->mRapi->StartDrawToFramebuffer((gfx->mRendersToFb && !gfx->mRtxOverlayFrame) ? gfx->mGameFb : 0,
                                        (float)gfx->mCurDimensions.height / gfx->mNativeDimensions.height);
     // Force viewport and scissor to reapply against the main framebuffer, in case a previous smaller
     // framebuffer truncated the values
@@ -4258,6 +4271,14 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 void Interpreter::StartFrame() {
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
     if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        // The RTX overlay still maps game coordinates to the current viewport.
+        mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height,
+                             &mCurWindowPosX, &mCurWindowPosY);
+        if (mCurDimensions.height == 0) {
+            mCurDimensions.height = 1;
+        }
+        mCurDimensions.aspect_ratio = (float)mCurDimensions.width / (float)mCurDimensions.height;
+        mFbActive = false;
         return;
     }
 #endif
@@ -4358,12 +4379,55 @@ void Interpreter::RunGuiOnly() {
     }
 }
 
+void Interpreter::RunRtxOverlay(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    mRtxOverlayPresented = false;
+    mGfxFrameBuffer = 0;
+    if (mCurDimensions.width == 0 || mCurDimensions.height == 0 ||
+        !mRapi->BeginRtxOverlayFrame(mCurDimensions.width, mCurDimensions.height)) {
+        return;
+    }
+    SpReset();
+    mGetPixelDepthPending.clear();
+    mGetPixelDepthCached.clear();
+    mCurMtxReplacements = &mtx_replacements;
+
+    // Coordinates stay relative to the overlay target, not the window.
+    const bool rendersToFb = mRendersToFb;
+    mRendersToFb = true;
+    mFbActive = false;
+    // Everything draws unless the game marks it as world geometry (Play_Main
+    // turns its world lists off); title and file-select screens draw in full.
+    mRtxOverlayFrame = true;
+    mRtxOverlayDraw = true;
+    mRapi->StartFrame();
+    mRdp->viewport_or_scissor_changed = true;
+    mRenderingState.viewport = {};
+    mRenderingState.scissor = {};
+
+    g_exec_stack.start((F3DGfx*)commands);
+    while (!g_exec_stack.cmd_stack.empty()) {
+        gfx_step();
+    }
+    Flush();
+    currentDir = std::stack<std::string>();
+
+    mRtxOverlayFrame = false;
+    mRtxOverlayDraw = false;
+    mRendersToFb = rendersToFb;
+    mFbActive = false;
+    mRapi->EndRtxOverlayFrame();
+    mGfxFrameBuffer = mRapi->GetRtxOverlayTextureId();
+    mRtxOverlayPresented = mGfxFrameBuffer != 0;
+}
+
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
     if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        RunRtxOverlay(commands, mtx_replacements);
         return;
     }
 #endif
+    mRtxOverlayPresented = false;
     SpReset();
 
     mGetPixelDepthPending.clear();
@@ -4476,6 +4540,19 @@ int Interpreter::CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t nat
 }
 
 void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
+    if (mRtxOverlayFrame) {
+        // Created while the ray tracer blocked DX11, so never sized yet.
+        auto info = mFrameBuffers.find(fb);
+        if (info != mFrameBuffers.end()) {
+            uint32_t width = info->second.orig_width, height = info->second.orig_height;
+            if (info->second.resize) {
+                AdjustWidthHeightForScale(width, height, info->second.native_width, info->second.native_height);
+            }
+            mRapi->UpdateFramebufferParameters(fb, width, height, 1, true, true, true, true);
+            info->second.applied_width = width;
+            info->second.applied_height = height;
+        }
+    }
     mRapi->StartDrawToFramebuffer(fb, noiseScale);
     mRapi->ClearFramebuffer(false, true);
 }

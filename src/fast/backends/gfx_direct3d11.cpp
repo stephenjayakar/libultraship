@@ -469,6 +469,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     }
 
     ThrowIfFailed(mDevice->CreateBlendState(&blend_desc, prg->blend_state.GetAddressOf()));
+    prg->alphaBlend = cc_features.opt_alpha;
 
     // Save some values
 
@@ -522,7 +523,7 @@ static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
 }
 
 void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
     // Create texture
@@ -594,7 +595,7 @@ void GfxRenderingAPIDX11::SetZmodeDecal(bool zmode_decal) {
 }
 
 void GfxRenderingAPIDX11::SetViewport(int x, int y, int width, int height) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
     D3D11_VIEWPORT viewport;
@@ -609,7 +610,7 @@ void GfxRenderingAPIDX11::SetViewport(int x, int y, int width, int height) {
 }
 
 void GfxRenderingAPIDX11::SetScissor(int x, int y, int width, int height) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
     D3D11_RECT rect;
@@ -626,7 +627,7 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 }
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
 
@@ -757,6 +758,16 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
 
+    if (mRtxOverlayActive) {
+        // Over a transparent target the native blend (which keeps alpha at
+        // its cleared 1.0) would leave translucent HUD pixels without
+        // coverage; accumulate alpha so the result is premultiplied RGBA.
+        ID3D11BlendState* blend =
+            mShaderProgram->alphaBlend ? mRtxOverlayBlendAlpha.Get() : mShaderProgram->blend_state.Get();
+        mContext->OMSetBlendState(blend, 0, 0xFFFFFFFF);
+        mLastBlendState = blend;
+    }
+
     mContext->Draw(buf_vbo_num_tris * 3, 0);
 }
 
@@ -764,8 +775,122 @@ void GfxRenderingAPIDX11::OnResize() {
     // create_render_target_views(true);
 }
 
+bool GfxRenderingAPIDX11::BeginRtxOverlayFrame(uint32_t width, uint32_t height) {
+    if (!mDevice || !mContext || width == 0 || height == 0) {
+        return false;
+    }
+    // Init() skips the draw buffers when the DX12 bridge owns the window.
+    if (!mVertexBuffer || !mPerFrameCb || !mPerDrawCb) {
+        D3D11_BUFFER_DESC desc = {};
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.ByteWidth = 256 * 32 * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+        desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        if (!mVertexBuffer && FAILED(mDevice->CreateBuffer(&desc, nullptr, mVertexBuffer.GetAddressOf()))) {
+            return false;
+        }
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.ByteWidth = sizeof(PerFrameCB);
+        if (!mPerFrameCb && FAILED(mDevice->CreateBuffer(&desc, nullptr, mPerFrameCb.GetAddressOf()))) {
+            return false;
+        }
+        desc.ByteWidth = sizeof(PerDrawCB);
+        if (!mPerDrawCb && FAILED(mDevice->CreateBuffer(&desc, nullptr, mPerDrawCb.GetAddressOf()))) {
+            return false;
+        }
+    }
+    if (!mRtxOverlayRtv || mRtxOverlayWidth != width || mRtxOverlayHeight != height) {
+        mRtxOverlayRtv.Reset();
+        mRtxOverlaySrv.Reset();
+        mRtxOverlayTexture.Reset();
+        mRtxOverlayDsv.Reset();
+        mRtxOverlayDepthTexture.Reset();
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, mRtxOverlayTexture.GetAddressOf())) ||
+            FAILED(mDevice->CreateRenderTargetView(mRtxOverlayTexture.Get(), nullptr,
+                                                   mRtxOverlayRtv.GetAddressOf())) ||
+            FAILED(mDevice->CreateShaderResourceView(mRtxOverlayTexture.Get(), nullptr,
+                                                     mRtxOverlaySrv.GetAddressOf()))) {
+            mRtxOverlayRtv.Reset();
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC depthDesc = desc;
+        depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(mDevice->CreateTexture2D(&depthDesc, nullptr, mRtxOverlayDepthTexture.GetAddressOf())) ||
+            FAILED(mDevice->CreateDepthStencilView(mRtxOverlayDepthTexture.Get(), nullptr,
+                                                   mRtxOverlayDsv.GetAddressOf()))) {
+            mRtxOverlayRtv.Reset();
+            return false;
+        }
+
+        if (!mRtxOverlayBlendAlpha) {
+            D3D11_BLEND_DESC blend = {};
+            blend.RenderTarget[0].BlendEnable = true;
+            blend.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+            blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+            blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+            blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(mDevice->CreateBlendState(&blend, mRtxOverlayBlendAlpha.GetAddressOf()))) {
+                mRtxOverlayRtv.Reset();
+                return false;
+            }
+        }
+        mRtxOverlayWidth = width;
+        mRtxOverlayHeight = height;
+    }
+
+    const float transparent[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->ClearRenderTargetView(mRtxOverlayRtv.Get(), transparent);
+    mContext->ClearDepthStencilView(mRtxOverlayDsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    mContext->OMSetRenderTargets(1, mRtxOverlayRtv.GetAddressOf(), mRtxOverlayDsv.Get());
+    mRenderTargetHeight = static_cast<int32_t>(height);
+    mCurrentFramebuffer = -1;
+
+    // ImGui rendered between frames and replaced pipeline state; drop the
+    // redundant-state caches so every draw rebinds what it needs.
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+    mLastBlendState = nullptr;
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        mLastResourceViews[i] = nullptr;
+        mLastSamplerStates[i] = nullptr;
+    }
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+    mRtxOverlayActive = true;
+    return true;
+}
+
+void GfxRenderingAPIDX11::EndRtxOverlayFrame() {
+    if (mRtxOverlayActive && mContext) {
+        ID3D11RenderTargetView* none = nullptr;
+        mContext->OMSetRenderTargets(1, &none, nullptr);
+    }
+    mRtxOverlayActive = false;
+}
+
+uintptr_t GfxRenderingAPIDX11::GetRtxOverlayTextureId() {
+    return reinterpret_cast<uintptr_t>(mRtxOverlaySrv.Get());
+}
+
 void GfxRenderingAPIDX11::StartFrame() {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
     // Set per-frame constant buffer
@@ -812,7 +937,9 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                                                       bool can_extract_depth) {
     // When RTX (DX12) is active, do not update DX11 framebuffer parameters.
     // This also prevents accessing the DX11 swap chain which may have been released.
-    if (IsDX11Blocked()) {
+    // The RTX overlay may still render into offscreen framebuffers (fb_id != 0),
+    // e.g. the pause menu's Link preview.
+    if (IsDX11Blocked() && !(mRtxOverlayActive && fb_id != 0)) {
         return;
     }
     FramebufferDX11& fb = mFrameBuffers[fb_id];
@@ -891,16 +1018,24 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 }
 
 void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
         return;
     }
-    FramebufferDX11& fb = mFrameBuffers[fb_id];
-    mRenderTargetHeight = mTextures[fb.texture_id].height;
+    if (mRtxOverlayActive && (fb_id == 0 || !mFrameBuffers[fb_id].render_target_view)) {
+        // The window framebuffer belongs to DX12; overlay draws land in the
+        // overlay target instead.
+        mRenderTargetHeight = static_cast<int32_t>(mRtxOverlayHeight);
+        mContext->OMSetRenderTargets(1, mRtxOverlayRtv.GetAddressOf(), mRtxOverlayDsv.Get());
+        mCurrentFramebuffer = -1;
+    } else {
+        FramebufferDX11& fb = mFrameBuffers[fb_id];
+        mRenderTargetHeight = mTextures[fb.texture_id].height;
 
-    mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(),
-                                 fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);
+        mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(),
+                                     fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);
 
-    mCurrentFramebuffer = fb_id;
+        mCurrentFramebuffer = fb_id;
+    }
 
     if (noise_scale != 0.0f) {
         mPerFrameCbData.noise_scale = 1.0f / noise_scale;
@@ -914,7 +1049,14 @@ void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
 }
 
 void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
-    if (IsDX11Blocked()) {
+    if (IsDX11Blocked() && !mRtxOverlayActive) {
+        return;
+    }
+    if (mCurrentFramebuffer < 0) {
+        // Overlay target: keep the HUD drawn so far, reset only depth.
+        if (depth && mRtxOverlayDsv) {
+            mContext->ClearDepthStencilView(mRtxOverlayDsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+        }
         return;
     }
     FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];

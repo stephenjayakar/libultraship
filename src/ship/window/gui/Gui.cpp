@@ -42,6 +42,8 @@
 
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
 #include <d3d11.h>
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 #include <wrl/client.h>
@@ -56,6 +58,9 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARA
 extern "C" volatile bool g_rtxPresentBlocked;
 
 extern "C" void RTX_UploadUIOverlay(const unsigned char* pixelData, unsigned int width, unsigned int height);
+extern "C" int RTX_SubmitUIOverlayShared(void* textureHandle, void* readyFenceHandle, unsigned long long readyValue,
+                                         unsigned int width, unsigned int height);
+extern "C" void RTX_GetUIOverlayConsumedFence(void** fenceHandle, unsigned long long* value);
 
 #endif
 
@@ -76,9 +81,47 @@ struct RtxUiCaptureState {
     std::vector<uint8_t> pixelBuffer;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Zero-copy path: the render target is shared with the DX12 renderer (NT
+    // handle) and the two APIs order their access with shared fences instead
+    // of a per-frame CPU readback (a 32 MB stall-and-copy at 4K).
+    bool shared = false;
+    HANDLE sharedHandle = nullptr;
+    ComPtr<ID3D11Fence> readyFence;
+    HANDLE readyFenceHandle = nullptr;
+    uint64_t readyValue = 0;
+    ComPtr<ID3D11Fence> consumedFence;
+    void* consumedFenceSource = nullptr;
 };
 
+void ReleaseRtxUiSharing(RtxUiCaptureState& state) {
+    if (state.sharedHandle) {
+        CloseHandle(state.sharedHandle);
+    }
+    if (state.readyFenceHandle) {
+        CloseHandle(state.readyFenceHandle);
+    }
+    state.shared = false;
+    state.sharedHandle = nullptr;
+    state.readyFence.Reset();
+    state.readyFenceHandle = nullptr;
+    state.readyValue = 0;
+    state.consumedFence.Reset();
+    state.consumedFenceSource = nullptr;
+}
+
 RtxUiCaptureState gRtxUiCaptureState;
+
+// The Fast3D RTX overlay is premultiplied (accumulated over transparent black);
+// ImGui's straight-alpha blend would multiply its color by alpha twice.
+ID3D11DeviceContext* gRtxUiContext = nullptr;
+ComPtr<ID3D11BlendState> gRtxPremultipliedBlend;
+
+void SetRtxOverlayPremultipliedBlend(const ImDrawList*, const ImDrawCmd*) {
+    if (gRtxUiContext && gRtxPremultipliedBlend) {
+        const float factor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        gRtxUiContext->OMSetBlendState(gRtxPremultipliedBlend.Get(), factor, 0xFFFFFFFF);
+    }
+}
 
 bool EnsureRtxUiCaptureTargets(ID3D11Device* device, uint32_t width, uint32_t height) {
     if (!device || width == 0 || height == 0) {
@@ -95,6 +138,7 @@ bool EnsureRtxUiCaptureTargets(ID3D11Device* device, uint32_t width, uint32_t he
     gRtxUiCaptureState.renderTargetView.Reset();
     gRtxUiCaptureState.readbackTexture.Reset();
     gRtxUiCaptureState.pixelBuffer.clear();
+    ReleaseRtxUiSharing(gRtxUiCaptureState);
     gRtxUiCaptureState.width = 0;
     gRtxUiCaptureState.height = 0;
 
@@ -108,7 +152,30 @@ bool EnsureRtxUiCaptureTargets(ID3D11Device* device, uint32_t width, uint32_t he
     rtDesc.Usage = D3D11_USAGE_DEFAULT;
     rtDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
 
-    HRESULT hr = device->CreateTexture2D(&rtDesc, nullptr, &gRtxUiCaptureState.renderTargetTexture);
+    // Prefer a shareable render target; plain one if sharing is unsupported.
+    ComPtr<ID3D11Device5> device5;
+    HRESULT hr = E_FAIL;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5)))) {
+        D3D11_TEXTURE2D_DESC sharedDesc = rtDesc;
+        sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        hr = device->CreateTexture2D(&sharedDesc, nullptr, &gRtxUiCaptureState.renderTargetTexture);
+        ComPtr<IDXGIResource1> dxgiResource;
+        if (SUCCEEDED(hr) && SUCCEEDED(gRtxUiCaptureState.renderTargetTexture.As(&dxgiResource)) &&
+            SUCCEEDED(dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                                       nullptr, &gRtxUiCaptureState.sharedHandle)) &&
+            SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&gRtxUiCaptureState.readyFence))) &&
+            SUCCEEDED(gRtxUiCaptureState.readyFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+                                                                        &gRtxUiCaptureState.readyFenceHandle))) {
+            gRtxUiCaptureState.shared = true;
+        } else {
+            gRtxUiCaptureState.renderTargetTexture.Reset();
+            ReleaseRtxUiSharing(gRtxUiCaptureState);
+            hr = E_FAIL;
+        }
+    }
+    if (FAILED(hr)) {
+        hr = device->CreateTexture2D(&rtDesc, nullptr, &gRtxUiCaptureState.renderTargetTexture);
+    }
     if (FAILED(hr)) {
         return false;
     }
@@ -167,6 +234,20 @@ void CaptureAndUploadImGuiForRtx(ImDrawData* data, const GuiWindowInitData& impl
     UINT prevViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     context->RSGetViewports(&prevViewportCount, prevViewports);
 
+    if (!gRtxPremultipliedBlend) {
+        D3D11_BLEND_DESC blend = {};
+        blend.RenderTarget[0].BlendEnable = true;
+        blend.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&blend, gRtxPremultipliedBlend.GetAddressOf());
+    }
+    gRtxUiContext = context;
+
     ID3D11RenderTargetView* uiRtv = gRtxUiCaptureState.renderTargetView.Get();
     context->OMSetRenderTargets(1, &uiRtv, nullptr);
 
@@ -179,27 +260,63 @@ void CaptureAndUploadImGuiForRtx(ImDrawData* data, const GuiWindowInitData& impl
     uiViewport.MaxDepth = 1.0f;
     context->RSSetViewports(1, &uiViewport);
 
+    // Shared path: before overwriting the target, wait (on the GPU) until the
+    // DX12 renderer has copied the last overlay it took. It publishes only
+    // values it has already submitted, so this never waits on a missing signal.
+    ComPtr<ID3D11DeviceContext4> context4;
+    if (gRtxUiCaptureState.shared) {
+        void* consumedHandle = nullptr;
+        unsigned long long consumedValue = 0;
+        RTX_GetUIOverlayConsumedFence(&consumedHandle, &consumedValue);
+        if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4))) && consumedHandle && consumedValue > 0) {
+            if (consumedHandle != gRtxUiCaptureState.consumedFenceSource) {
+                gRtxUiCaptureState.consumedFence.Reset();
+                gRtxUiCaptureState.consumedFenceSource = nullptr;
+                ComPtr<ID3D11Device5> device5;
+                if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5))) &&
+                    SUCCEEDED(device5->OpenSharedFence(static_cast<HANDLE>(consumedHandle),
+                                                       IID_PPV_ARGS(&gRtxUiCaptureState.consumedFence)))) {
+                    gRtxUiCaptureState.consumedFenceSource = consumedHandle;
+                }
+            }
+            if (gRtxUiCaptureState.consumedFence) {
+                context4->Wait(gRtxUiCaptureState.consumedFence.Get(), consumedValue);
+            }
+        }
+    }
+
     const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     context->ClearRenderTargetView(uiRtv, clearColor);
 
     ImGui_ImplDX11_RenderDrawData(data);
-    context->CopyResource(gRtxUiCaptureState.readbackTexture.Get(), gRtxUiCaptureState.renderTargetTexture.Get());
 
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(context->Map(gRtxUiCaptureState.readbackTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        const size_t rowBytes = static_cast<size_t>(fbWidth) * 4;
-        uint8_t* dst = gRtxUiCaptureState.pixelBuffer.data();
-        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-        for (int row = 0; row < fbHeight; row++) {
-            memcpy(dst + static_cast<size_t>(row) * rowBytes,
-                   src + static_cast<size_t>(row) * mapped.RowPitch,
-                   rowBytes);
+    bool handedOff = false;
+    if (gRtxUiCaptureState.shared && context4) {
+        context4->Signal(gRtxUiCaptureState.readyFence.Get(), ++gRtxUiCaptureState.readyValue);
+        context->Flush();
+        handedOff = RTX_SubmitUIOverlayShared(gRtxUiCaptureState.sharedHandle, gRtxUiCaptureState.readyFenceHandle,
+                                              gRtxUiCaptureState.readyValue, static_cast<unsigned int>(fbWidth),
+                                              static_cast<unsigned int>(fbHeight)) != 0;
+    }
+    if (!handedOff) {
+        context->CopyResource(gRtxUiCaptureState.readbackTexture.Get(), gRtxUiCaptureState.renderTargetTexture.Get());
+
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(context->Map(gRtxUiCaptureState.readbackTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            const size_t rowBytes = static_cast<size_t>(fbWidth) * 4;
+            uint8_t* dst = gRtxUiCaptureState.pixelBuffer.data();
+            const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+            for (int row = 0; row < fbHeight; row++) {
+                memcpy(dst + static_cast<size_t>(row) * rowBytes,
+                       src + static_cast<size_t>(row) * mapped.RowPitch,
+                       rowBytes);
+            }
+            context->Unmap(gRtxUiCaptureState.readbackTexture.Get(), 0);
+
+            RTX_UploadUIOverlay(gRtxUiCaptureState.pixelBuffer.data(),
+                                static_cast<unsigned int>(fbWidth),
+                                static_cast<unsigned int>(fbHeight));
         }
-        context->Unmap(gRtxUiCaptureState.readbackTexture.Get(), 0);
-
-        RTX_UploadUIOverlay(gRtxUiCaptureState.pixelBuffer.data(),
-                            static_cast<unsigned int>(fbWidth),
-                            static_cast<unsigned int>(fbHeight));
     }
 
     context->OMSetRenderTargets(1, &prevRTV, prevDSV);
@@ -942,7 +1059,18 @@ void Gui::DrawGame() {
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
         ImGui::SetCursorPos(pos);
+#if defined(ENABLE_DX11)
+        const bool rtxOverlay = mInterpreter.lock()->mRtxOverlayPresented;
+        if (rtxOverlay) {
+            ImGui::GetWindowDrawList()->AddCallback(SetRtxOverlayPremultipliedBlend, nullptr);
+        }
+#endif
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+#if defined(ENABLE_DX11)
+        if (rtxOverlay) {
+            ImGui::GetWindowDrawList()->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+        }
+#endif
     }
 
     ImGui::End();

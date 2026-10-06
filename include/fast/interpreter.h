@@ -514,6 +514,13 @@ class Interpreter {
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
+    // RTX overlay frame: geometry is only processed between G_NOOP type-9
+    // markers (gDPNoOpTag3(pkt, 9, 0, 1) on, (..., 0) off), which the game
+    // emits around its 2D overlay phase.
+    bool mRtxOverlayFrame = false;
+    bool mRtxOverlayDraw = false;
+    bool mRtxOverlayPresented = false;
+    void RunRtxOverlay(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
     std::vector<std::string> shader_ids;
     int mInterpolationIndex;
     int mInterpolationIndexTarget;
