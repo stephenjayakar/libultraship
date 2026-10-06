@@ -41,11 +41,21 @@
 #endif
 
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+#include <d3d11.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
+#include <wrl/client.h>
+#include "fast/backends/gfx_dx12_bridge.h"
 
 // NOLINTNEXTLINE
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// Global flag declared in gfx_dxgi.cpp: when true, DX12 RTX has taken over rendering
+// and ALL DX11 operations (including ImGui DX11 backend) must be skipped.
+// This prevents DX11 ImGui rendering from fighting with DX12 RTX output.
+extern "C" volatile bool g_rtxPresentBlocked;
+
+extern "C" void RTX_UploadUIOverlay(const unsigned char* pixelData, unsigned int width, unsigned int height);
 
 #endif
 
@@ -54,6 +64,158 @@ namespace Ship {
 #define TOGGLE_PAD_BTN ImGuiKey_GamepadBack
 
 static Ship::Coords mPrevMousePos;
+
+#if defined(ENABLE_DX11)
+namespace {
+using Microsoft::WRL::ComPtr;
+
+struct RtxUiCaptureState {
+    ComPtr<ID3D11Texture2D> renderTargetTexture;
+    ComPtr<ID3D11RenderTargetView> renderTargetView;
+    ComPtr<ID3D11Texture2D> readbackTexture;
+    std::vector<uint8_t> pixelBuffer;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+RtxUiCaptureState gRtxUiCaptureState;
+
+bool EnsureRtxUiCaptureTargets(ID3D11Device* device, uint32_t width, uint32_t height) {
+    if (!device || width == 0 || height == 0) {
+        return false;
+    }
+
+    if (gRtxUiCaptureState.renderTargetTexture && gRtxUiCaptureState.readbackTexture &&
+        gRtxUiCaptureState.renderTargetView && gRtxUiCaptureState.width == width &&
+        gRtxUiCaptureState.height == height) {
+        return true;
+    }
+
+    gRtxUiCaptureState.renderTargetTexture.Reset();
+    gRtxUiCaptureState.renderTargetView.Reset();
+    gRtxUiCaptureState.readbackTexture.Reset();
+    gRtxUiCaptureState.pixelBuffer.clear();
+    gRtxUiCaptureState.width = 0;
+    gRtxUiCaptureState.height = 0;
+
+    D3D11_TEXTURE2D_DESC rtDesc = {};
+    rtDesc.Width = width;
+    rtDesc.Height = height;
+    rtDesc.MipLevels = 1;
+    rtDesc.ArraySize = 1;
+    rtDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtDesc.SampleDesc.Count = 1;
+    rtDesc.Usage = D3D11_USAGE_DEFAULT;
+    rtDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    HRESULT hr = device->CreateTexture2D(&rtDesc, nullptr, &gRtxUiCaptureState.renderTargetTexture);
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    hr = device->CreateRenderTargetView(gRtxUiCaptureState.renderTargetTexture.Get(), nullptr,
+                                        &gRtxUiCaptureState.renderTargetView);
+    if (FAILED(hr)) {
+        gRtxUiCaptureState.renderTargetTexture.Reset();
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC readbackDesc = rtDesc;
+    readbackDesc.BindFlags = 0;
+    readbackDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    readbackDesc.Usage = D3D11_USAGE_STAGING;
+
+    hr = device->CreateTexture2D(&readbackDesc, nullptr, &gRtxUiCaptureState.readbackTexture);
+    if (FAILED(hr)) {
+        gRtxUiCaptureState.renderTargetTexture.Reset();
+        gRtxUiCaptureState.renderTargetView.Reset();
+        return false;
+    }
+
+    gRtxUiCaptureState.width = width;
+    gRtxUiCaptureState.height = height;
+    gRtxUiCaptureState.pixelBuffer.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+    return true;
+}
+
+void CaptureAndUploadImGuiForRtx(ImDrawData* data, const GuiWindowInitData& impl) {
+    if (!data) {
+        return;
+    }
+
+    auto* device = static_cast<ID3D11Device*>(impl.Dx11.Device);
+    auto* context = static_cast<ID3D11DeviceContext*>(impl.Dx11.DeviceContext);
+    if (!device || !context) {
+        return;
+    }
+
+    const int fbWidth = static_cast<int>(data->DisplaySize.x * data->FramebufferScale.x);
+    const int fbHeight = static_cast<int>(data->DisplaySize.y * data->FramebufferScale.y);
+    if (fbWidth <= 0 || fbHeight <= 0) {
+        return;
+    }
+
+    if (!EnsureRtxUiCaptureTargets(device, static_cast<uint32_t>(fbWidth), static_cast<uint32_t>(fbHeight))) {
+        return;
+    }
+
+    ID3D11RenderTargetView* prevRTV = nullptr;
+    ID3D11DepthStencilView* prevDSV = nullptr;
+    context->OMGetRenderTargets(1, &prevRTV, &prevDSV);
+
+    D3D11_VIEWPORT prevViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT prevViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetViewports(&prevViewportCount, prevViewports);
+
+    ID3D11RenderTargetView* uiRtv = gRtxUiCaptureState.renderTargetView.Get();
+    context->OMSetRenderTargets(1, &uiRtv, nullptr);
+
+    D3D11_VIEWPORT uiViewport = {};
+    uiViewport.TopLeftX = 0.0f;
+    uiViewport.TopLeftY = 0.0f;
+    uiViewport.Width = static_cast<float>(fbWidth);
+    uiViewport.Height = static_cast<float>(fbHeight);
+    uiViewport.MinDepth = 0.0f;
+    uiViewport.MaxDepth = 1.0f;
+    context->RSSetViewports(1, &uiViewport);
+
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    context->ClearRenderTargetView(uiRtv, clearColor);
+
+    ImGui_ImplDX11_RenderDrawData(data);
+    context->CopyResource(gRtxUiCaptureState.readbackTexture.Get(), gRtxUiCaptureState.renderTargetTexture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (SUCCEEDED(context->Map(gRtxUiCaptureState.readbackTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        const size_t rowBytes = static_cast<size_t>(fbWidth) * 4;
+        uint8_t* dst = gRtxUiCaptureState.pixelBuffer.data();
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+        for (int row = 0; row < fbHeight; row++) {
+            memcpy(dst + static_cast<size_t>(row) * rowBytes,
+                   src + static_cast<size_t>(row) * mapped.RowPitch,
+                   rowBytes);
+        }
+        context->Unmap(gRtxUiCaptureState.readbackTexture.Get(), 0);
+
+        RTX_UploadUIOverlay(gRtxUiCaptureState.pixelBuffer.data(),
+                            static_cast<unsigned int>(fbWidth),
+                            static_cast<unsigned int>(fbHeight));
+    }
+
+    context->OMSetRenderTargets(1, &prevRTV, prevDSV);
+    if (prevViewportCount > 0) {
+        context->RSSetViewports(prevViewportCount, prevViewports);
+    }
+
+    if (prevRTV) {
+        prevRTV->Release();
+    }
+    if (prevDSV) {
+        prevDSV->Release();
+    }
+}
+} // namespace
+#endif
 
 Gui::Gui(std::vector<std::shared_ptr<GuiWindow>> guiWindows) : mNeedsConsoleVariableSave(false) {
     mGameOverlay = std::make_shared<GameOverlay>();
@@ -339,6 +501,9 @@ void Gui::ImGuiBackendNewFrame() {
 
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
+            // Still need to call ImGui_ImplDX11_NewFrame() even with DX12 RTX active,
+            // because it creates font sampler/texture that ImGui::NewFrame() requires.
+            // Without this, ImGui::NewFrame() crashes on the font atlas.
             ImGui_ImplDX11_NewFrame();
             break;
 #endif
@@ -625,11 +790,37 @@ void Gui::SetCursorVisibilityTime(int32_t seconds) {
 }
 
 void Gui::StartFrame() {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    static int s_sfStep = 0;
+    s_sfStep++;
+    auto sfLog = [&](const char* msg) {
+        if (s_sfStep <= 5) {
+            FILE* f = fopen("rtx_bridge_debug.log", "a");
+            if (f) { fprintf(f, "Gui::StartFrame #%d: %s\n", s_sfStep, msg); fflush(f); fclose(f); }
+        }
+    };
+    sfLog("before CursorTimeoutTick");
+#endif
     CursorTimeoutTick();
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sfLog("before HandleMouseCapture");
+#endif
     HandleMouseCapture();
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sfLog("before ImGuiBackendNewFrame");
+#endif
     ImGuiBackendNewFrame();
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sfLog("before ImGuiWMNewFrame");
+#endif
     ImGuiWMNewFrame();
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sfLog("before ImGui::NewFrame");
+#endif
     ImGui::NewFrame();
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sfLog("StartFrame COMPLETE");
+#endif
 }
 
 void Gui::EndFrame() {
@@ -772,17 +963,26 @@ void Gui::DrawFloatingWindows() {
             // Set back the GL mContext for next frame
             SDL_GL_MakeCurrent(backupCurrentWindow, backupCurrentContext);
         } else {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+            // When RTX (DX12) is active, skip DX11 ImGui viewport rendering.
+            // Viewport platform windows use DX11 render targets and would fight with DX12.
+            if (true /* HARD BLOCK: always skip DX11 viewport rendering */ && backend == WindowBackend::FAST3D_DXGI_DX11) {
+                // Skip - DX12 RTX handles all rendering
+            } else
+#endif
+            {
 #ifdef __APPLE__
-            // Metal requires additional frame setup to get ImGui ready for drawing floating windows
-            if (backend == WindowBackend::FAST3D_SDL_METAL) {
-                Fast::GfxRenderingAPIMetal* api =
-                    (Fast::GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
-                api->SetupFloatingFrame();
-            }
+                // Metal requires additional frame setup to get ImGui ready for drawing floating windows
+                if (backend == WindowBackend::FAST3D_SDL_METAL) {
+                    Fast::GfxRenderingAPIMetal* api =
+                        (Fast::GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
+                    api->SetupFloatingFrame();
+                }
 #endif
 
-            ImGui::UpdatePlatformWindows();
-            ImGui::RenderPlatformWindowsDefault();
+                ImGui::UpdatePlatformWindows();
+                ImGui::RenderPlatformWindowsDefault();
+            }
         }
     }
 }
@@ -795,12 +995,38 @@ void Gui::CheckSaveCvars() {
 }
 
 void Gui::StartDraw() {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    static int s_sdStep = 0;
+    s_sdStep++;
+    auto sdLog = [&](const char* msg) {
+        if (s_sdStep <= 5) {
+            FILE* f = fopen("rtx_bridge_debug.log", "a");
+            if (f) { fprintf(f, "Gui::StartDraw #%d: %s\n", s_sdStep, msg); fflush(f); fclose(f); }
+        }
+    };
+    sdLog("ENTRY — calling StartFrame()");
+#endif
+
     // Initialize the frame.
     StartFrame();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sdLog("StartFrame done — calling DrawMenu()");
+#endif
+
     // Draw the gui menus
     DrawMenu();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sdLog("DrawMenu done — calling CalculateGameViewport()");
+#endif
+
     // Calculate the available space the game can render to
     CalculateGameViewport();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    sdLog("CalculateGameViewport done — StartDraw COMPLETE");
+#endif
 }
 
 void Gui::EndDraw() {
@@ -857,8 +1083,16 @@ void Gui::ImGuiRenderDrawData(ImDrawData* data) {
 
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
-            ImGui_ImplDX11_RenderDrawData(data);
+            {
+            const bool bridgeActive = GfxDX12Bridge_IsActive();
+            const bool blocked = g_rtxPresentBlocked || bridgeActive;
+            if (!blocked) {
+                ImGui_ImplDX11_RenderDrawData(data);
+                break;
+            }
+            CaptureAndUploadImGuiForRtx(data, mImpl);
             break;
+            }
 #endif
         default:
             break;

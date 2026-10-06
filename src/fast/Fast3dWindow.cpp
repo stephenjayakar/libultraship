@@ -190,17 +190,54 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         return false;
     }
 
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    // Crash diagnosis: log each step to file
+    static int s_darStep = 0;
+    s_darStep++;
+    auto darLog = [&](const char* msg) {
+        if (s_darStep <= 5) {
+            FILE* f = fopen("rtx_bridge_debug.log", "a");
+            if (f) { fprintf(f, "DrawAndRun #%d: %s\n", s_darStep, msg); fflush(f); fclose(f); }
+        }
+    };
+    darLog("before gui->StartDraw()");
+#endif
+
     auto gui = wnd->GetGui();
     // Setup of the backend frames and draw initial Window and GUI menus
     gui->StartDraw();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    darLog("after StartDraw, before StartFrame");
+#endif
+
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    darLog("after StartFrame, before Run");
+#endif
+
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    darLog("after Run, before EndDraw");
+#endif
+
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    darLog("after EndDraw, before EndFrame");
+#endif
+
     // Finalize swap buffers
     mInterpreter->EndFrame();
+
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    darLog("after EndFrame (done)");
+#endif
 
     return true;
 }

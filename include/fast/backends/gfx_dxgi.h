@@ -48,6 +48,9 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
 
     HWND GetWindowHandle();
     IDXGISwapChain1* GetSwapChain();
+    // Release the swap chain and associated state so another graphics API
+    // (e.g. DX12) can create its own swap chain on the same HWND.
+    void ReleaseSwapChain();
     // These need to be public to be accessible in the window callback
     void CreateSwapChain(IUnknown* mDevice, std::function<void()>&& before_destroy_fn);
     void CreateFactoryAndDevice(bool debug, int d3d_version, class GfxRenderingAPIDX11* self,

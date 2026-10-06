@@ -24,6 +24,7 @@
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
+#include "fast/backends/gfx_dx12_bridge.h"
 
 #include "fast/backends/gfx_screen_config.h"
 #include "ship/window/gui/Gui.h"
@@ -40,6 +41,24 @@
 #include <ship/resource/ResourceManager.h>
 #include "spdlog/spdlog.h"
 #include "nlohmann/json.hpp"
+
+// Global flag: when true, RTX (DX12) has taken over rendering and DX11 must
+// not draw anything.  Declared in gfx_dxgi.cpp and set by the RTX integration
+// layer in RTXHooks.cpp / OTRGlobals.cpp.
+extern "C" volatile bool g_rtxPresentBlocked;
+
+// Callback function pointer from gfx_dxgi.cpp - secondary RTX block check.
+// Declared extern here; defined in gfx_dxgi.cpp.
+extern "C" void gfx_dxgi_set_rtx_block_callback(bool (*callback)());
+
+// Local helper: uses DX12 bridge as primary check, falls back to global flag.
+static inline bool IsDX11Blocked() {
+    if (GfxDX12Bridge_IsActive()) {
+        g_rtxPresentBlocked = true;
+        return true;
+    }
+    return g_rtxPresentBlocked;
+}
 
 #define DEBUG_D3D 0
 
@@ -158,6 +177,32 @@ void GfxRenderingAPIDX11::Init() {
         mLastZmodeDecal = -1;
         mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     });
+
+    // =========================================================================
+    // DX12 Bridge: If active, the swap chain is DX12-owned.
+    // Skip DX11 framebuffer/swap-chain-dependent setup.
+    // Still create DX11 device resources (buffers, shaders) for compatibility
+    // and ImGui initialization.
+    // =========================================================================
+    if (IsDX11Blocked()) {
+        printf("[RTX-Bridge] DX11::Init: Bridge active, skipping DX11 framebuffer setup\n");
+        // Still need to create a dummy framebuffer entry
+        FramebufferDX11& fb = mFrameBuffers[CreateFramebuffer()];
+        fb.msaa_level = 1;
+        // Set default dimensions from window
+        uint32_t w, h;
+        int32_t px, py;
+        mWindowBackend->GetDimensions(&w, &h, &px, &py);
+        mTextures[fb.texture_id].width = w;
+        mTextures[fb.texture_id].height = h;
+        // Skip MSAA, vertex buffers, shaders - not needed for DX12 path
+        // But we still need ImGui
+        Ship::GuiWindowInitData window_impl;
+        window_impl.Dx11 = { mWindowBackend->GetWindowHandle(), mContext.Get(), mDevice.Get() };
+        Ship::Context::GetInstance()->GetWindow()->GetGui()->Init(window_impl);
+        return;
+    }
+
 
     // Create D3D Debug mDevice if in debug mode
 
@@ -477,6 +522,9 @@ static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
 }
 
 void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     // Create texture
 
     TextureData* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
@@ -546,6 +594,9 @@ void GfxRenderingAPIDX11::SetZmodeDecal(bool zmode_decal) {
 }
 
 void GfxRenderingAPIDX11::SetViewport(int x, int y, int width, int height) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     D3D11_VIEWPORT viewport;
     viewport.TopLeftX = x;
     viewport.TopLeftY = mRenderTargetHeight - y - height;
@@ -558,6 +609,9 @@ void GfxRenderingAPIDX11::SetViewport(int x, int y, int width, int height) {
 }
 
 void GfxRenderingAPIDX11::SetScissor(int x, int y, int width, int height) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     D3D11_RECT rect;
     rect.left = x;
     rect.top = mRenderTargetHeight - y - height;
@@ -572,6 +626,9 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 }
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+    if (IsDX11Blocked()) {
+        return;
+    }
 
     if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
@@ -708,6 +765,9 @@ void GfxRenderingAPIDX11::OnResize() {
 }
 
 void GfxRenderingAPIDX11::StartFrame() {
+    if (IsDX11Blocked()) {
+        return;
+    }
     // Set per-frame constant buffer
     ID3D11Buffer* buffers[2] = { mPerFrameCb.Get(), mPerDrawCb.Get() };
     mContext->PSSetConstantBuffers(0, 2, buffers);
@@ -720,6 +780,9 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    if (IsDX11Blocked()) {
+        return;
+    }
     mContext->Flush();
 }
 
@@ -747,6 +810,11 @@ int GfxRenderingAPIDX11::CreateFramebuffer() {
 void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                       bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                       bool can_extract_depth) {
+    // When RTX (DX12) is active, do not update DX11 framebuffer parameters.
+    // This also prevents accessing the DX11 swap chain which may have been released.
+    if (IsDX11Blocked()) {
+        return;
+    }
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     TextureData& tex = mTextures[fb.texture_id];
 
@@ -783,8 +851,12 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                                                                 tex.resource_view.ReleaseAndGetAddressOf()));
             }
         } else if (diff || (render_target && tex.texture.Get() == nullptr)) {
-            DXGI_SWAP_CHAIN_DESC1 desc1;
             IDXGISwapChain1* swap_chain = mWindowBackend->GetSwapChain();
+            // Guard: swap chain may be null if released for DX12 RTX takeover
+            if (!swap_chain) {
+                return;
+            }
+            DXGI_SWAP_CHAIN_DESC1 desc1;
             ThrowIfFailed(swap_chain->GetDesc1(&desc1));
             if (desc1.Width != width || desc1.Height != height) {
                 fb.render_target_view.Reset();
@@ -819,6 +891,9 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 }
 
 void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     mRenderTargetHeight = mTextures[fb.texture_id].height;
 
@@ -839,8 +914,12 @@ void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
 }
 
 void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];
     if (color) {
+        // Standard black clear color
         const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
         mContext->ClearRenderTargetView(fb.render_target_view.Get(), clearColor);
     }
@@ -850,6 +929,9 @@ void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
 }
 
 void GfxRenderingAPIDX11::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
+    if (IsDX11Blocked()) {
+        return;
+    }
     FramebufferDX11& fb_dst = mFrameBuffers[fb_id_target];
     FramebufferDX11& fb_src = mFrameBuffers[fb_id_source];
 
@@ -868,6 +950,7 @@ void GfxRenderingAPIDX11::SelectTextureFb(int fbID) {
 
 void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
                                           int dstX0, int dstY0, int dstX1, int dstY1) {
+    if (IsDX11Blocked()) return;
     if (fb_src_id >= (int)mFrameBuffers.size() || fb_dst_id >= (int)mFrameBuffers.size()) {
         return;
     }
@@ -936,6 +1019,7 @@ void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX
 }
 
 void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
+    if (IsDX11Blocked()) return;
     if (fb_id >= (int)mFrameBuffers.size()) {
         return;
     }
@@ -974,9 +1058,10 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
 
     // Copy the mapped values to a temp array that we can process later
     uint32_t* temp = new uint32_t[width * height]();
+    const size_t packedRowPitch = static_cast<size_t>(width) * sizeof(uint32_t);
     for (size_t i = 0; i < height; i++) {
-        memcpy((uint8_t*)temp + (resource.RowPitch * i), (uint8_t*)resource.pData + (resource.RowPitch * i),
-               resource.RowPitch);
+        memcpy(reinterpret_cast<uint8_t*>(temp) + (packedRowPitch * i),
+               reinterpret_cast<uint8_t*>(resource.pData) + (resource.RowPitch * i), packedRowPitch);
     }
 
     mContext->Unmap(staging, 0);
@@ -1012,6 +1097,7 @@ FilteringMode GfxRenderingAPIDX11::GetTextureFilter() {
 
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
+    if (IsDX11Blocked()) return {};
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     TextureData& td = mTextures[fb.texture_id];
 
@@ -1340,9 +1426,6 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     processor.bind_include_loader(dx_include_fs);
     auto result = processor.process();
     numFloats = raw_numFloats;
-    // SPDLOG_INFO("=========== DX11 SHADER ============");
-    // SPDLOG_INFO(result);
-    // SPDLOG_INFO("====================================");
     return result;
 }
 } // namespace Fast

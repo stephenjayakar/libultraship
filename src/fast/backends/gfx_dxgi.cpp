@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <cstdio>
 
 #include <map>
 #include <set>
@@ -34,6 +35,7 @@
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
+#include "fast/backends/gfx_dx12_bridge.h"
 
 #define WINCLASS_NAME L"N64GAME"
 #define GFX_BACKEND_NAME "DXGI"
@@ -52,6 +54,42 @@
 #endif
 using QWORD = uint64_t; // For NEXTRAWINPUTBLOCK
 
+// =============================================================================
+// DX12 Bridge: When GfxDX12Bridge_IsActive() returns true, the swap chain was
+// created with the DX12 command queue and DX12 owns rendering/presenting.
+// DX11 draw calls, clears, and presents are all skipped.
+// =============================================================================
+
+// Legacy compatibility: g_rtxPresentBlocked is kept for code that still
+// references it, but its value is now driven by GfxDX12Bridge_IsActive().
+extern "C" volatile bool g_rtxPresentBlocked = false;
+
+// Legacy callback - kept for backward compatibility but no longer primary mechanism.
+static bool (*s_rtxBlockQueryCallback)() = nullptr;
+
+extern "C" void gfx_dxgi_set_rtx_block_callback(bool (*callback)()) {
+    s_rtxBlockQueryCallback = callback;
+    if (callback) {
+        printf("[RTX-Bridge] RTX block callback registered: %p\n", (void*)callback);
+    }
+}
+
+// Helper: returns true if DX11 rendering/presenting should be blocked.
+// Now uses the DX12 bridge as the primary check.
+static inline bool IsDX11Blocked() {
+    if (GfxDX12Bridge_IsActive()) {
+        g_rtxPresentBlocked = true;
+        return true;
+    }
+    if (g_rtxPresentBlocked) return true;
+    if (s_rtxBlockQueryCallback && s_rtxBlockQueryCallback()) {
+        g_rtxPresentBlocked = true;
+        return true;
+    }
+    return false;
+}
+
+
 namespace Fast {
 
 void GfxWindowBackendDXGI::LoadDxgi() {
@@ -61,6 +99,11 @@ void GfxWindowBackendDXGI::LoadDxgi() {
 }
 
 void GfxWindowBackendDXGI::ApplyMaxFrameLatency(bool first) {
+    // Guard: RTX active or swap chain released.
+    if (IsDX11Blocked() || !swap_chain) {
+        return;
+    }
+
     DXGI_SWAP_CHAIN_DESC swap_desc = {};
     swap_chain->GetDesc(&swap_desc);
 
@@ -582,6 +625,9 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
 
     LoadDxgi();
 
+    // Provide HWND to DX12 bridge early, before swap chain creation
+    GfxDX12Bridge_SetHWND(h_wnd);
+
     ShowWindow(h_wnd, SW_SHOW);
     UpdateWindow(h_wnd);
 
@@ -741,6 +787,10 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 }
 
 bool GfxWindowBackendDXGI::IsFrameReady() {
+    // DX12 Bridge: when active, always report ready (DX12 handles frame pacing)
+    if (IsDX11Blocked() || !swap_chain) {
+        return true;
+    }
     DXGI_FRAME_STATISTICS stats;
     if (swap_chain->GetFrameStatistics(&stats) == S_OK &&
         (stats.SyncRefreshCount != 0 || stats.SyncQPCTime.QuadPart != 0ULL)) {
@@ -867,11 +917,27 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
 }
 
 void GfxWindowBackendDXGI::SwapBuffersBegin() {
-    // mLengthInVsyncFrames (now mVsyncEnabled) was used as present interval. Present interval >1 (aka fractional
-    // V-Sync) breaks VRR and introduces even more input lag than capping via normal V-Sync does. Get the present
-    // interval the user wants instead (V-Sync toggle).
+    // =========================================================================
+    // DX12 Bridge: If active, DX12 handles rendering and presenting.
+    // We call GfxDX12Bridge_Present which renders into the swap chain and presents.
+    // =========================================================================
+    if (IsDX11Blocked()) {
+        if (swap_chain && GfxDX12Bridge_IsActive()) {
+            GfxDX12Bridge_Present(swap_chain.Get());
+        }
+        return;
+    }
+
+    // DX11 path: normal present
+    if (!swap_chain) {
+        Sleep(1);
+        return;
+    }
+
+    // Determine present interval from user V-Sync setting.
     mVsyncEnabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1) ? 1 : 0;
 
+    // Frame pacing: sleep until the target frame time
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
@@ -893,8 +959,9 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
+
+    // Present the DX11 back buffer.
     if (mTearingSupport && !mVsyncEnabled) {
-        // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, DXGI_PRESENT_ALLOW_TEARING));
     } else {
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, 0));
@@ -902,18 +969,27 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
 
     UINT this_present_id;
     if (swap_chain->GetLastPresentCount(&this_present_id) == S_OK) {
-        mPendingFrameStats.insert(std::make_pair(this_present_id, mVsyncEnabled));
+        mPendingFrameStats.insert(std::make_pair(this_present_id, (UINT)mVsyncEnabled));
     }
     mDroppedFrame = false;
 }
 
 void GfxWindowBackendDXGI::SwapBuffersEnd() {
+    // DX12 Bridge active: nothing for DX11 to do.
+    if (IsDX11Blocked()) {
+        return;
+    }
+
+    // Guard: swap chain released
+    if (!swap_chain) {
+        return;
+    }
+
     LARGE_INTEGER t0, t1, t2;
     QueryPerformanceCounter(&t0);
     QueryPerformanceCounter(&t1);
 
     if (mAppliedMaxFrameLatency > mMaxFrameLatency) {
-        // If latency is decreased, you have to wait the same amout of times as the old latency was set to
         int times_to_wait = mAppliedMaxFrameLatency;
         int latency = mMaxFrameLatency;
         mMaxFrameLatency = 1;
@@ -926,8 +1002,7 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
         }
         mMaxFrameLatency = latency;
         ApplyMaxFrameLatency(false);
-
-        return; // Make sure we don't wait a second time on the waitable object, since that would hang the program
+        return;
     } else if (mAppliedMaxFrameLatency != mMaxFrameLatency) {
         ApplyMaxFrameLatency(false);
     }
@@ -936,7 +1011,6 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
         if (mWaitableObject != nullptr) {
             WaitForSingleObject(mWaitableObject, INFINITE);
         }
-        // else TODO: maybe sleep until some estimated time the frame will be shown to reduce lag
     }
 
     DXGI_FRAME_STATISTICS stats;
@@ -944,13 +1018,11 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
 
     QueryPerformanceCounter(&t2);
 
-    mZeroLatency = mPendingFrameStats.rbegin()->first == stats.PresentCount;
-
-    // printf(L"done %I64u gpu:%d wait:%d freed:%I64u frame:%u %u monitor:%u t:%I64u\n", (unsigned long
-    // long)(t0.QuadPart - qpc_init), (int)(t1.QuadPart - t0.QuadPart), (int)(t2.QuadPart - t0.QuadPart), (unsigned
-    // long long)(t2.QuadPart - qpc_init), mPendingFrameStats.rbegin()->first, stats.PresentCount,
-    // stats.SyncRefreshCount, (unsigned long long)(stats.SyncQPCTime.QuadPart - qpc_init));
+    if (!mPendingFrameStats.empty()) {
+        mZeroLatency = mPendingFrameStats.rbegin()->first == stats.PresentCount;
+    }
 }
+
 
 double GfxWindowBackendDXGI::GetTime() {
     LARGE_INTEGER t;
@@ -1015,6 +1087,25 @@ void GfxWindowBackendDXGI::CreateSwapChain(IUnknown* mDevice, std::function<void
     bool win8 = IsWindows8OrGreater();            // DXGI_SCALING_NONE is only supported on Win8 and beyond
     bool dxgi_13 = CreateDXGIFactory2 != nullptr; // DXGI 1.3 introduced waitable object
 
+    // =========================================================================
+    // DX12 Bridge: If the bridge is active, use the DX12 command queue instead
+    // of the DX11 device for swap chain creation.  This makes the swap chain
+    // DX12-owned so DX12 can render and present to it directly.
+    // =========================================================================
+    IUnknown* swapChainDevice = mDevice; // Default: use whatever was passed (DX11 device)
+    bool usingDX12Bridge = false;
+
+    if (GfxDX12Bridge_IsActive()) {
+        IUnknown* dx12Queue = GfxDX12Bridge_GetCommandQueue();
+        if (dx12Queue != nullptr) {
+            swapChainDevice = dx12Queue;
+            usingDX12Bridge = true;
+            printf("[RTX-Bridge] CreateSwapChain: Using DX12 command queue (%p) instead of DX11 device\n", (void*)dx12Queue);
+        } else {
+            printf("[RTX-Bridge] WARNING: Bridge active but GetCommandQueue returned null, falling back to DX11\n");
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {};
     swap_chain_desc.BufferCount = 3;
     swap_chain_desc.Width = 0;
@@ -1022,25 +1113,48 @@ void GfxWindowBackendDXGI::CreateSwapChain(IUnknown* mDevice, std::function<void
     swap_chain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     swap_chain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swap_chain_desc.Scaling = win8 ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
-    swap_chain_desc.SwapEffect =
-        mDXGI11_4 ? DXGI_SWAP_EFFECT_FLIP_DISCARD : // Introduced in DXGI 1.4 and Windows 10
-            DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; // Apparently flip sequential was also backported to Win 7 Platform Update
-    swap_chain_desc.Flags = dxgi_13 ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
-    if (mTearingSupport) {
-        swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; // Now we can use DXGI_PRESENT_ALLOW_TEARING
+
+    if (usingDX12Bridge) {
+        // DX12 swap chains: use FLIP_DISCARD, no waitable object (DX12 handles its own sync)
+        swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        swap_chain_desc.Flags = 0;
+        if (mTearingSupport) {
+            swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
+    } else {
+        swap_chain_desc.SwapEffect =
+            mDXGI11_4 ? DXGI_SWAP_EFFECT_FLIP_DISCARD :
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        swap_chain_desc.Flags = dxgi_13 ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
+        if (mTearingSupport) {
+            swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
     }
     swap_chain_desc.SampleDesc.Count = 1;
 
-    ThrowIfFailed(mFactory->CreateSwapChainForHwnd(mDevice, h_wnd, &swap_chain_desc, nullptr, nullptr, &swap_chain));
+    printf("[RTX-Bridge] Creating swap chain: device=%p hwnd=%p usingDX12=%d\n",
+           (void*)swapChainDevice, (void*)h_wnd, usingDX12Bridge ? 1 : 0);
+
+    ThrowIfFailed(mFactory->CreateSwapChainForHwnd(swapChainDevice, h_wnd, &swap_chain_desc, nullptr, nullptr, &swap_chain));
     ThrowIfFailed(mFactory->MakeWindowAssociation(h_wnd, DXGI_MWA_NO_ALT_ENTER));
 
-    ApplyMaxFrameLatency(true);
+    printf("[RTX-Bridge] Swap chain created successfully: %p\n", (void*)swap_chain.Get());
+
+    // Notify the DX12 bridge about the swap chain and HWND
+    if (usingDX12Bridge) {
+        GfxDX12Bridge_SetSwapChain(swap_chain.Get());
+        GfxDX12Bridge_SetHWND(h_wnd);
+        printf("[RTX-Bridge] Swap chain and HWND provided to DX12 bridge\n");
+    } else {
+        ApplyMaxFrameLatency(true);
+    }
 
     ThrowIfFailed(swap_chain->GetDesc1(&swap_chain_desc));
 
-    mSwapChainDevice = mDevice;
+    mSwapChainDevice = swapChainDevice;
     mBeforeDestroySwapChainFn = std::move(before_destroy_fn);
 }
+
 
 bool GfxWindowBackendDXGI::IsRunning() {
     return mIsRunning;
@@ -1052,6 +1166,24 @@ HWND GfxWindowBackendDXGI::GetWindowHandle() {
 
 IDXGISwapChain1* GfxWindowBackendDXGI::GetSwapChain() {
     return swap_chain.Get();
+}
+
+void GfxWindowBackendDXGI::ReleaseSwapChain() {
+    printf("[RTX] DXGI::ReleaseSwapChain() called, swap_chain=%p, hwnd=%p\n",
+           (void*)swap_chain.Get(), (void*)h_wnd);
+    if (mBeforeDestroySwapChainFn) {
+        mBeforeDestroySwapChainFn();
+    }
+    if (mWaitableObject) {
+        CloseHandle(mWaitableObject);
+        mWaitableObject = nullptr;
+    }
+
+    swap_chain.Reset();
+    mSwapChainDevice.Reset();
+
+    printf("[RTX] DXGI swap chain released: now null=%s\n",
+           swap_chain == nullptr ? "YES" : "NO");
 }
 
 const char* GfxWindowBackendDXGI::GetKeyName(int scancode) {

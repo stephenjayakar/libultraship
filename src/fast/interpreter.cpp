@@ -29,6 +29,13 @@
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
+// DX12 Bridge: provides GfxDX12Bridge_IsActive() and related functions.
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+#include "fast/backends/gfx_dx12_bridge.h"
+extern "C" volatile bool g_rtxPresentBlocked;
+#endif
+
+
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/Utils.h"
@@ -4249,6 +4256,11 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 }
 
 void Interpreter::StartFrame() {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        return;
+    }
+#endif
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
@@ -4302,6 +4314,11 @@ void Interpreter::StartFrame() {
 GfxExecStack g_exec_stack = {};
 
 void Interpreter::RunGuiOnly() {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        return;
+    }
+#endif
     SpReset();
 
     mGetPixelDepthPending.clear();
@@ -4342,6 +4359,11 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        return;
+    }
+#endif
     SpReset();
 
     mGetPixelDepthPending.clear();
@@ -4407,6 +4429,14 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 }
 
 void Interpreter::EndFrame() {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    if (GfxDX12Bridge_IsActive() || g_rtxPresentBlocked) {
+        // DX12 bridge is active: skip DX11 EndFrame/FinishRender
+        // but still call SwapBuffersBegin which dispatches to bridge Present
+        mWapi->SwapBuffersBegin();
+        return;
+    }
+#endif
     mRapi->EndFrame();
     mWapi->SwapBuffersBegin();
     mRapi->FinishRender();
@@ -4687,4 +4717,29 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+extern "C" int gfx_read_current_framebuffer_rgba16(uint16_t* rgba16_buf, size_t pixel_capacity,
+                                                   uint32_t* width, uint32_t* height) {
+    std::shared_ptr<Fast::Interpreter> gfx = Fast::mInstance.lock();
+    if (!gfx || !width || !height) {
+        return 0;
+    }
+
+    const uint32_t currentWidth = gfx->mCurDimensions.width;
+    const uint32_t currentHeight = gfx->mCurDimensions.height;
+    *width = currentWidth;
+    *height = currentHeight;
+    const size_t requiredPixels = static_cast<size_t>(currentWidth) * currentHeight;
+    if (!rgba16_buf) {
+        return requiredPixels > 0 ? 1 : 0;
+    }
+    if (currentWidth == 0 || currentHeight == 0 || pixel_capacity < requiredPixels || !gfx->mRapi) {
+        return 0;
+    }
+
+    gfx->Flush();
+    const int framebufferId = gfx->mRendersToFb ? gfx->mGameFb : 0;
+    gfx->mRapi->ReadFramebufferToCPU(framebufferId, currentWidth, currentHeight, rgba16_buf);
+    return 1;
 }

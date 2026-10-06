@@ -529,3 +529,7 @@ const char* GfxGetOpcodeName(int8_t opcode);
 extern "C" void gfx_texture_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize);
+// Reads the completed Fast3D framebuffer as native RGBA5551 pixels. Pass a
+// null buffer to query the required dimensions without performing a readback.
+extern "C" int gfx_read_current_framebuffer_rgba16(uint16_t* rgba16_buf, size_t pixel_capacity,
+                                                   uint32_t* width, uint32_t* height);
