@@ -921,15 +921,17 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     // DX12 Bridge: If active, DX12 handles rendering and presenting.
     // We call GfxDX12Bridge_Present which renders into the swap chain and presents.
     // =========================================================================
-    if (IsDX11Blocked()) {
-        if (swap_chain && GfxDX12Bridge_IsActive()) {
-            GfxDX12Bridge_Present(swap_chain.Get());
-        }
+    // Game logic advances once per tick of interpolated frames, so frames
+    // must leave at the target rate. The DX12 bridge used to return before
+    // the limiter below, leaving only its VSync present: the game ran at the
+    // monitor's refresh when the GPU kept up and slowed when it did not.
+    const bool dx12Bridge = IsDX11Blocked();
+    if (dx12Bridge && !(swap_chain && GfxDX12Bridge_IsActive())) {
         return;
     }
 
     // DX11 path: normal present
-    if (!swap_chain) {
+    if (!dx12Bridge && !swap_chain) {
         Sleep(1);
         return;
     }
@@ -959,6 +961,11 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
+
+    if (dx12Bridge) {
+        GfxDX12Bridge_Present(swap_chain.Get());
+        return;
+    }
 
     // Present the DX11 back buffer.
     if (mTearingSupport && !mVsyncEnabled) {
